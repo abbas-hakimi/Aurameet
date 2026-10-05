@@ -1,0 +1,1327 @@
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\app.js
+============================================================
+
+import express from "express";
+import cors from "cors";
+import { createServer } from "node:http";
+import { initializeSocket } from "./sockets/socket.js";
+import env from "./config/env.js";
+import connectDB from "./config/database.js";
+import authRoutes from "./routes/auth.routes.js";
+import meetingRoutes from "./routes/meeting.routes.js";
+import {
+    errorHandler
+} from "./middleware/error.middleware.js";
+
+const app = express();
+const server = createServer(app);
+const io = initializeSocket(server, env);
+app.set("io", io);
+
+// --------------------
+// Middleware
+// --------------------
+
+app.use(
+    cors({
+        origin: env.clientUrl,
+        credentials: true
+    })
+);
+
+app.use(express.json({ limit: "10kb" }));
+app.use(express.urlencoded({ extended: true }));
+app.use((req, _res, next) => { req.body ??= {}; next(); });
+
+
+//routes
+app.use("/api/auth", authRoutes);
+app.use("/api/meetings", meetingRoutes);
+
+// --------------------
+// Test route
+// --------------------
+
+app.get("/", (req, res) => {
+    res.json({
+        success: true,
+        message: "AuraMeet API is running"
+    });
+});
+
+app.use((req, res) => {
+    res.status(404).json({
+        success: false,
+        message: "Route not found"
+    });
+});
+app.use(errorHandler);
+
+// --------------------
+// Start server
+// --------------------
+
+const startServer = async () => {
+    await connectDB();
+
+    server.listen(env.port, () => {
+        console.log(`AuraMeet server running on port ${env.port}`);
+    });
+};
+
+startServer();
+
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\config\database.js
+============================================================
+
+import mongoose from "mongoose";
+import env from "./env.js";
+
+const connectDB = async () => {
+    try {
+        const connection = await mongoose.connect(env.mongoUri);
+
+        console.log(
+            `MongoDB connected: ${connection.connection.host}`
+        );
+    } catch (error) {
+        console.error("MongoDB connection failed:", error.message);
+        process.exit(1);
+    }
+};
+
+export default connectDB;
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\config\env.js
+============================================================
+
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const env = {
+    port: process.env.PORT || 8000,
+
+    mongoUri: process.env.MONGO_URI,
+
+    jwtAccessSecret: process.env.JWT_ACCESS_SECRET,
+    jwtRefreshSecret: process.env.JWT_REFRESH_SECRET,
+
+    clientUrl: process.env.CLIENT_URL || "http://localhost:5173"
+};
+
+export default env;
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\controllers\auth.controller.js
+============================================================
+
+import AppError from "../utils/AppError.js";
+import { registerUser, loginUser, refreshAccessToken, logoutUser } from "../services/auth.service.js";
+
+const validateCredentials = ({ name, username, password }, registering = false) => {
+    if (registering && (typeof name !== "string" || !name.trim() || name.trim().length > 80)) throw new AppError("Name must be 1 to 80 characters", 400);
+    if (typeof username !== "string" || !/^[a-z0-9_.]{3,30}$/i.test(username.trim())) throw new AppError("Username must be 3 to 30 letters, numbers, dots or underscores", 400);
+    if (typeof password !== "string" || password.length < 8 || Buffer.byteLength(password, "utf8") > 72) throw new AppError("Password must be 8 to 72 bytes", 400);
+};
+
+export const register = async (req, res) => {
+    validateCredentials(req.body, true);
+    const data = await registerUser(req.body);
+    res.status(201).json({ success: true, message: "Registration successful", data });
+};
+export const login = async (req, res) => {
+    validateCredentials(req.body);
+    const data = await loginUser(req.body);
+    res.json({ success: true, message: "Login successful", data });
+};
+export const getMe = (req, res) => res.json({ success: true, data: { user: req.user } });
+export const refresh = async (req, res) => {
+    if (typeof req.body.refreshToken !== "string" || !req.body.refreshToken) throw new AppError("Refresh token required", 401);
+    const accessToken = await refreshAccessToken(req.body.refreshToken);
+    res.json({ success: true, data: { accessToken } });
+};
+export const logout = async (req, res) => {
+    if (typeof req.body.refreshToken !== "string") throw new AppError("Refresh token required", 400);
+    await logoutUser(req.body.refreshToken);
+    res.json({ success: true, message: "Logged out successfully" });
+};
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\controllers\meeting.controller.js
+============================================================
+
+import mongoose from "mongoose";
+import AppError from "../utils/AppError.js";
+import { createMeeting, getMeetingByCode, joinMeeting, getUserMeetings, startMeeting, endMeeting, leaveMeeting, updateMeetingSettings, admitParticipant, getMeetingParticipants } from "../services/meeting.service.js";
+import { admitWaitingSockets, closeMeetingRoom, removeSocketFromMeeting } from "../sockets/meeting.socket.js";
+
+export const create = async (req, res) => {
+    const meeting = await createMeeting({ ...req.body, hostId: req.user._id });
+    res.status(201).json({ success: true, data: { meeting } });
+};
+export const getMeeting = async (req, res) => {
+    const meeting = await getMeetingByCode(req.params.meetingCode, req.user._id);
+    res.json({ success: true, data: { meeting } });
+};
+export const join = async (req, res) => {
+    const result = await joinMeeting({ meetingCode: req.params.meetingCode, userId: req.user._id, name: req.user.name });
+    if (result.meeting.host.toString() !== req.user._id.toString()) result.meeting.waitingParticipants = undefined;
+    if (result.waiting) {
+        const hostId = result.meeting.host.toString();
+        req.app.get("io").to(`user:${hostId}`).emit("waiting:participant", {
+            user: { id: req.user._id.toString(), name: req.user.name, username: req.user.username },
+            requestedAt: result.meeting.waitingParticipants.find(w => w.user.toString() === req.user._id.toString())?.requestedAt
+        });
+    }
+    res.json({ success: true, data: result });
+};
+export const getMyMeetings = async (req, res) => {
+    const meetings = await getUserMeetings(req.user._id);
+    res.json({ success: true, data: { meetings } });
+};
+export const start = async (req, res) => {
+    const meeting = await startMeeting(req.params.meetingCode, req.user._id);
+    req.app.get("io").to(meeting.meetingCode).emit("meeting:started", { meetingCode: meeting.meetingCode, startedAt: meeting.startedAt });
+    res.json({ success: true, data: { meeting } });
+};
+export const end = async (req, res) => {
+    const meeting = await endMeeting(req.params.meetingCode, req.user._id);
+    await closeMeetingRoom(req.app.get("io"), meeting.meetingCode);
+    res.json({ success: true, data: { meeting } });
+};
+export const leave = async (req, res) => {
+    const participant = await leaveMeeting(req.params.meetingCode, req.user._id);
+    const io = req.app.get("io");
+    const sockets = await io.in(`user:${req.user._id}`).fetchSockets();
+    for (const socket of sockets) if (socket.data.meetingCode === req.params.meetingCode.toUpperCase()) await removeSocketFromMeeting(io, socket, true);
+    res.json({ success: true, data: { participant } });
+};
+export const updateSettings = async (req, res) => {
+    const meeting = await updateMeetingSettings(req.params.meetingCode, req.user._id, req.body);
+    req.app.get("io").to(meeting.meetingCode).emit("meeting:settings-updated", { settings: meeting.settings });
+    res.json({ success: true, data: { settings: meeting.settings } });
+};
+export const admit = async (req, res) => {
+    const userId = req.body.userId;
+    if (!mongoose.isValidObjectId(userId)) throw new AppError("Invalid participant user id", 400);
+    const participant = await admitParticipant(req.params.meetingCode, req.user._id, userId);
+    await admitWaitingSockets(req.app.get("io"), req.params.meetingCode.toUpperCase(), userId.toString(), participant);
+    res.json({ success: true, data: { participant } });
+};
+export const getParticipants = async (req, res) => {
+    const participants = await getMeetingParticipants(req.params.meetingCode, req.user._id);
+    res.json({ success: true, data: { participants } });
+};
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\middleware\auth.middleware.js
+============================================================
+
+import jwt from "jsonwebtoken";
+import env from "../config/env.js";
+import User from "../models/User.js";
+
+const authenticate = async (req, res, next) => {
+    try {
+        const authHeader = req.headers.authorization;
+
+        if (!authHeader || !authHeader.startsWith("Bearer ")) {
+            return res.status(401).json({
+                success: false,
+                message: "Authentication required"
+            });
+        }
+
+        const token = authHeader.split(" ")[1];
+
+        const decoded = jwt.verify(
+            token,
+            env.jwtAccessSecret
+        );
+
+        const user = await User.findById(decoded.sub);
+
+        if (!user) {
+            return res.status(401).json({
+                success: false,
+                message: "User no longer exists"
+            });
+        }
+
+        req.user = user;
+
+        next();
+
+    } catch (error) {
+
+        return res.status(401).json({
+            success: false,
+            message: "Invalid or expired access token"
+        });
+    }
+};
+
+export default authenticate;
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\middleware\error.middleware.js
+============================================================
+
+export const errorHandler = (
+    err,
+    req,
+    res,
+    next
+) => {
+    let statusCode = err.statusCode || 500;
+    let message = statusCode < 500 ? err.message : "Internal server error";
+    if (err?.code === 11000) {
+        statusCode = 409;
+        message = "A record with that value already exists";
+    } else if (err?.name === "CastError" || err?.name === "ValidationError") {
+        statusCode = 400;
+        message = "Invalid request data";
+    } else if (err?.type === "entity.parse.failed") {
+        statusCode = 400;
+        message = "Invalid JSON request body";
+    } else if (err?.type === "entity.too.large") {
+        statusCode = 413;
+        message = "Request body is too large";
+    }
+    if (statusCode >= 500) console.error(err);
+
+    res.status(statusCode).json({
+        success: false,
+        message
+    });
+};
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\middleware\socketAuth.js
+============================================================
+
+import jwt from "jsonwebtoken";
+import env from "../config/env.js";
+import User from "../models/User.js";
+
+export const socketAuth = async (socket, next) => {
+
+    try {
+
+        const token =
+            socket.handshake.auth?.token;
+
+        if (!token) {
+            return next(
+                new Error("Authentication required")
+            );
+        }
+
+        const decoded = jwt.verify(
+            token,
+            env.jwtAccessSecret
+        );
+
+        const user = await User.findById(
+            decoded.sub
+        );
+
+        if (!user) {
+            return next(
+                new Error("User not found")
+            );
+        }
+
+        socket.user = {
+            id: user._id.toString(),
+            name: user.name,
+            username: user.username,
+            avatar: user.avatar,
+            role: user.role
+        };
+
+        next();
+
+    } catch (error) {
+
+        next(
+            new Error("Invalid or expired access token")
+        );
+    }
+};
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\models\Meeting.js
+============================================================
+
+import mongoose from "mongoose";
+
+const meetingSchema = new mongoose.Schema(
+    {
+        meetingCode: {
+            type: String,
+            required: true,
+            unique: true,
+            index: true
+        },
+
+        title: {
+            type: String,
+            required: true,
+            trim: true
+        },
+
+        host: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User",
+            required: true
+        },
+
+        status: {
+            type: String,
+            enum: ["scheduled", "live", "ended"],
+            default: "scheduled"
+        },
+
+        scheduledAt: {
+            type: Date
+        },
+
+        startedAt: {
+            type: Date
+        },
+
+        endedAt: {
+            type: Date
+        },
+
+        waitingParticipants: [
+    {
+        user: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User"
+        },
+
+        name: {
+            type: String,
+            required: true
+        },
+
+        requestedAt: {
+            type: Date,
+            default: Date.now
+        }
+    }
+],
+
+        settings: {
+            waitingRoom: {
+                type: Boolean,
+                default: false
+            },
+
+            lockMeeting: {
+                type: Boolean,
+                default: false
+            },
+
+            allowChat: {
+                type: Boolean,
+                default: true
+            },
+
+            allowScreenShare: {
+                type: Boolean,
+                default: true
+            }
+        }
+    },
+    {
+        timestamps: true
+    }
+);
+
+meetingSchema.index({ host: 1, createdAt: -1 });
+
+const Meeting = mongoose.model("Meeting", meetingSchema);
+
+export default Meeting;
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\models\Message.js
+============================================================
+
+import mongoose from "mongoose";
+
+const messageSchema = new mongoose.Schema(
+    {
+        meeting: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Meeting",
+            required: true
+        },
+
+        sender: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User",
+            required: true
+        },
+
+        message: {
+            type: String,
+            required: true,
+            trim: true
+        },
+
+        type: {
+            type: String,
+            enum: ["user", "system"],
+            default: "user"
+        }
+    },
+    {
+        timestamps: true
+    }
+);
+
+messageSchema.index({ meeting: 1, createdAt: 1 });
+
+const Message = mongoose.model("Message", messageSchema);
+
+export default Message;
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\models\Participant.js
+============================================================
+
+import mongoose from "mongoose";
+
+const participantSchema = new mongoose.Schema(
+    {
+        meeting: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Meeting",
+            required: true
+        },
+
+        user: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User"
+        },
+
+        name: {
+            type: String,
+            required: true
+        },
+
+        role: {
+            type: String,
+            enum: ["host", "co-host", "participant", "guest"],
+            default: "participant"
+        },
+
+        joinedAt: {
+            type: Date,
+            default: Date.now
+        },
+
+        leftAt: {
+            type: Date
+        }
+    },
+    {
+        timestamps: true
+    }
+);
+
+participantSchema.index({ meeting: 1, user: 1, leftAt: 1 });
+
+const Participant = mongoose.model(
+    "Participant",
+    participantSchema
+);
+
+export default Participant;
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\models\User.js
+============================================================
+
+import mongoose from "mongoose";
+
+const userSchema = new mongoose.Schema(
+    {
+        name: {
+            type: String,
+            required: true,
+            trim: true
+        },
+
+        username: {
+            type: String,
+            required: true,
+            unique: true,
+            lowercase: true,
+            trim: true
+        },
+
+        password: {
+            type: String,
+            required: true,
+            select: false
+        },
+
+        avatar: {
+            type: String,
+            default: ""
+        },
+
+        role: {
+            type: String,
+            enum: ["user", "admin"],
+            default: "user"
+        },
+
+        lastLogin: {
+            type: Date
+        },
+
+        refreshToken: {
+            type: String,
+            default: null,
+            select: false
+        },
+    },
+    {
+        timestamps: true
+    }
+);
+
+const User = mongoose.model("User", userSchema);
+
+export default User;
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\routes\auth.routes.js
+============================================================
+
+import express from "express";
+
+import {
+    register,
+    login,
+    getMe,
+    refresh,
+    logout
+} from "../controllers/auth.controller.js";
+import authenticate from "../middleware/auth.middleware.js";
+
+const router = express.Router();
+
+router.post("/register", register);
+router.post("/login", login);
+router.get("/me", authenticate, getMe);
+router.post("/refresh", refresh);
+router.post("/logout", logout);
+
+export default router;
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\routes\meeting.routes.js
+============================================================
+
+import express from "express";
+
+import authenticate from "../middleware/auth.middleware.js";
+
+import {
+    create,
+    getMeeting,
+    join,
+    getMyMeetings,
+    start,
+    end,
+    leave,
+    updateSettings,
+    admit,
+    getParticipants
+} from "../controllers/meeting.controller.js";
+
+const router = express.Router();
+
+router.use(authenticate);
+
+router.post("/", create);
+
+router.get("/", getMyMeetings);
+
+router.get("/:meetingCode", getMeeting);
+
+router.post("/:meetingCode/join", join);
+
+router.post("/:meetingCode/start", start);
+
+router.post("/:meetingCode/end", end);
+
+router.post("/:meetingCode/leave", leave);
+
+router.patch(
+    "/:meetingCode/settings",
+    updateSettings
+);
+
+router.post(
+    "/:meetingCode/admit",
+    admit
+);
+
+router.get(
+    "/:meetingCode/participants",
+    getParticipants
+);
+
+export default router;
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\services\auth.service.js
+============================================================
+
+import bcrypt from "bcrypt";
+
+import User from "../models/User.js";
+import AppError from "../utils/AppError.js";
+import {
+    generateAccessToken,
+    generateRefreshToken,
+    verifyRefreshToken
+} from "../utils/token.js";
+
+export const registerUser = async ({ name, username, password }) => {
+
+    name = name.trim();
+    username = username.trim().toLowerCase();
+
+    const existingUser = await User.findOne({ username });
+
+    if (existingUser) {
+        throw new AppError("Username already exists", 409);
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const user = await User.create({
+        name,
+        username,
+        password: hashedPassword
+    });
+
+    const accessToken = generateAccessToken(user);
+    const refreshToken = generateRefreshToken(user);
+
+    user.refreshToken = refreshToken;
+    await user.save();
+
+    return {
+        user: {
+            id: user._id,
+            name: user.name,
+            username: user.username,
+            role: user.role
+        },
+        accessToken,
+        refreshToken
+    };
+};
+
+
+export const loginUser = async ({ username, password }) => {
+
+    username = username.trim().toLowerCase();
+    const user = await User.findOne({ username }).select("+password +refreshToken");
+
+    if (!user) {
+        throw new AppError("Invalid username or password", 401);
+    }
+
+    const passwordMatched = await bcrypt.compare(
+        password,
+        user.password
+    );
+
+    if (!passwordMatched) {
+        throw new AppError("Invalid username or password", 401);
+    }
+
+    user.lastLogin = new Date();
+    await user.save();
+
+    const accessToken = generateAccessToken(user);
+    const refreshToken = generateRefreshToken(user);
+
+    user.refreshToken = refreshToken;
+    await user.save();
+
+    return {
+        user: {
+            id: user._id,
+            name: user.name,
+            username: user.username,
+            role: user.role
+        },
+        accessToken,
+        refreshToken
+    };
+};
+
+export const refreshAccessToken = async (refreshToken) => {
+    let decoded;
+    try { decoded = verifyRefreshToken(refreshToken); }
+    catch { throw new AppError("Invalid or expired refresh token", 401); }
+
+    const user = await User.findById(decoded.sub).select("+refreshToken");
+
+    if (!user) {
+        throw new AppError("Invalid or expired refresh token", 401);
+    }
+
+    if (user.refreshToken !== refreshToken) throw new AppError("Invalid refresh token", 401);
+
+    const accessToken = generateAccessToken(user);
+
+    return accessToken;
+};
+
+export const logoutUser = async (refreshToken) => {
+    try {
+        const decoded = verifyRefreshToken(refreshToken);
+
+        const user = await User.findById(decoded.sub).select("+refreshToken");
+
+        if (user && user.refreshToken === refreshToken) {
+            user.refreshToken = null;
+            await user.save();
+        }
+    } catch {
+        // Token is already invalid/expired
+    }
+};
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\services\meeting.service.js
+============================================================
+
+import crypto from "crypto";
+import mongoose from "mongoose";
+import Meeting from "../models/Meeting.js";
+import Participant from "../models/Participant.js";
+import AppError from "../utils/AppError.js";
+
+const settingKeys = ["waitingRoom", "lockMeeting", "allowChat", "allowScreenShare"];
+const codeFilter = (code) => {
+    if (typeof code !== "string" || !/^[a-z0-9]{8}$/i.test(code)) throw new AppError("Invalid meeting code", 400);
+    return code.toUpperCase();
+};
+const findMeeting = async (code) => {
+    const meeting = await Meeting.findOne({ meetingCode: codeFilter(code) });
+    if (!meeting) throw new AppError("Meeting not found", 404);
+    return meeting;
+};
+const requireHost = (meeting, userId, action) => {
+    if (meeting.host.toString() !== userId.toString()) throw new AppError(`Only the host can ${action}`, 403);
+};
+
+export const createMeeting = async ({ title, hostId, scheduledAt, settings = {} }) => {
+    if (typeof title !== "string" || !title.trim() || title.trim().length > 120) throw new AppError("Meeting title must be 1 to 120 characters", 400);
+    if (scheduledAt !== undefined && (typeof scheduledAt !== "string" || !Number.isFinite(Date.parse(scheduledAt)))) throw new AppError("Invalid scheduled date", 400);
+    validateSettings(settings);
+    let meetingCode;
+    do { meetingCode = crypto.randomBytes(4).toString("hex").toUpperCase(); }
+    while (await Meeting.exists({ meetingCode }));
+    return Meeting.create({ meetingCode, title: title.trim(), host: hostId, scheduledAt, settings });
+};
+
+const validateSettings = (settings) => {
+    if (!settings || typeof settings !== "object" || Array.isArray(settings) || Object.keys(settings).some(k => !settingKeys.includes(k)) || Object.values(settings).some(v => typeof v !== "boolean")) throw new AppError("Invalid meeting settings", 400);
+};
+
+export const getMeetingByCode = async (meetingCode, userId) => {
+    const meeting = await Meeting.findOne({ meetingCode: codeFilter(meetingCode) }).populate("host", "name username avatar");
+    if (!meeting) throw new AppError("Meeting not found", 404);
+    if (meeting.host._id.toString() !== userId.toString()) meeting.waitingParticipants = undefined;
+    return meeting;
+};
+
+export const joinMeeting = async ({ meetingCode, userId, name }) => {
+    const meeting = await findMeeting(meetingCode);
+    if (meeting.status === "ended") throw new AppError("Meeting has ended", 409);
+    if (meeting.status === "scheduled") throw new AppError("Meeting has not started yet", 409);
+    const isHost = meeting.host.toString() === userId.toString();
+    const active = await Participant.findOne({ meeting: meeting._id, user: userId, leftAt: null });
+    if (active) return { meeting, waiting: false, participant: active };
+    if (meeting.settings.lockMeeting && !isHost) throw new AppError("Meeting is locked", 409);
+    if (meeting.settings.waitingRoom && !isHost) {
+        await Meeting.updateOne({ _id: meeting._id, "waitingParticipants.user": { $ne: userId } }, { $push: { waitingParticipants: { user: userId, name, requestedAt: new Date() } } });
+        const freshMeeting = await Meeting.findById(meeting._id);
+        return { meeting: freshMeeting, waiting: true, participant: null };
+    }
+    if (meeting.waitingParticipants.some(w => w.user.toString() === userId.toString())) {
+        await Meeting.updateOne({ _id: meeting._id }, { $pull: { waitingParticipants: { user: userId } } });
+        meeting.waitingParticipants = meeting.waitingParticipants.filter(w => w.user.toString() !== userId.toString());
+    }
+    const participant = await Participant.findOneAndUpdate(
+        { meeting: meeting._id, user: userId, leftAt: null },
+        { $setOnInsert: { name, role: isHost ? "host" : "participant", joinedAt: new Date() } },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    return { meeting, waiting: false, participant };
+};
+
+export const getUserMeetings = (userId) => Meeting.find({ host: userId }).sort({ createdAt: -1 }).populate("host", "name username");
+
+export const startMeeting = async (meetingCode, userId) => {
+    const meeting = await findMeeting(meetingCode);
+    requireHost(meeting, userId, "start the meeting");
+    if (meeting.status !== "scheduled") throw new AppError(meeting.status === "live" ? "Meeting is already live" : "Meeting has already ended", 409);
+    meeting.status = "live";
+    meeting.startedAt = new Date();
+    await meeting.save();
+    return meeting;
+};
+
+export const endMeeting = async (meetingCode, userId) => {
+    const meeting = await findMeeting(meetingCode);
+    requireHost(meeting, userId, "end the meeting");
+    if (meeting.status !== "live") throw new AppError("Only a live meeting can be ended", 409);
+    meeting.status = "ended";
+    meeting.endedAt = new Date();
+    meeting.waitingParticipants = [];
+    await meeting.save();
+    await Participant.updateMany({ meeting: meeting._id, leftAt: null }, { $set: { leftAt: meeting.endedAt } });
+    return meeting;
+};
+
+export const leaveMeeting = async (meetingCode, userId) => {
+    const meeting = await findMeeting(meetingCode);
+    const participant = await Participant.findOne({ meeting: meeting._id, user: userId, leftAt: null });
+    if (!participant) throw new AppError("Participant is not currently in the meeting", 409);
+    participant.leftAt = new Date();
+    await participant.save();
+    return participant;
+};
+
+export const updateMeetingSettings = async (meetingCode, userId, settings) => {
+    validateSettings(settings);
+    const meeting = await findMeeting(meetingCode);
+    requireHost(meeting, userId, "change meeting settings");
+    Object.assign(meeting.settings, settings);
+    await meeting.save();
+    return meeting;
+};
+
+export const admitParticipant = async (meetingCode, hostId, participantUserId) => {
+    if (!mongoose.isValidObjectId(participantUserId)) throw new AppError("Invalid participant user id", 400);
+    const meeting = await findMeeting(meetingCode);
+    requireHost(meeting, hostId, "admit participants");
+    if (meeting.status !== "live") throw new AppError("Meeting is not live", 409);
+    const waiting = meeting.waitingParticipants.find(w => w.user.toString() === participantUserId.toString());
+    if (!waiting) throw new AppError("Participant is not in the waiting room", 409);
+    const pulled = await Meeting.updateOne({ _id: meeting._id, "waitingParticipants.user": participantUserId }, { $pull: { waitingParticipants: { user: participantUserId } } });
+    if (!pulled.modifiedCount) throw new AppError("Participant is not in the waiting room", 409);
+    return Participant.findOneAndUpdate(
+        { meeting: meeting._id, user: participantUserId, leftAt: null },
+        { $setOnInsert: { name: waiting.name, role: "participant", joinedAt: new Date() } },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+};
+
+export const removeParticipant = async (meetingCode, hostId, participantUserId) => {
+    if (!mongoose.isValidObjectId(participantUserId)) throw new AppError("Invalid participant user id", 400);
+    const meeting = await findMeeting(meetingCode);
+    requireHost(meeting, hostId, "remove participants");
+    if (meeting.host.toString() === participantUserId.toString()) throw new AppError("Host cannot be removed", 400);
+    const participant = await Participant.findOne({ meeting: meeting._id, user: participantUserId, leftAt: null });
+    if (!participant) throw new AppError("Participant is not currently in the meeting", 409);
+    participant.leftAt = new Date();
+    await participant.save();
+    return participant;
+};
+
+export const removeWaitingParticipant = async (meetingCode, hostId, participantUserId) => {
+    if (!mongoose.isValidObjectId(participantUserId)) throw new AppError("Invalid participant user id", 400);
+    const meeting = await findMeeting(meetingCode);
+    requireHost(meeting, hostId, "reject participants");
+    const result = await Meeting.updateOne({ _id: meeting._id, "waitingParticipants.user": participantUserId }, { $pull: { waitingParticipants: { user: participantUserId } } });
+    if (!result.modifiedCount) throw new AppError("Participant is not in the waiting room", 409);
+    return true;
+};
+
+export const getMeetingParticipants = async (meetingCode, userId) => {
+    const meeting = await findMeeting(meetingCode);
+    requireHost(meeting, userId, "view participant analytics");
+    return Participant.find({ meeting: meeting._id }).populate("user", "name username avatar").sort({ joinedAt: 1 });
+};
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\sockets\chat.socket.js
+============================================================
+
+import Meeting from "../models/Meeting.js";
+import Message from "../models/Message.js";
+
+export const registerChatSocket = (io, socket) => {
+    let windowStarted = Date.now();
+    let sends = 0;
+    const safe = (event, fn) => async (payload) => {
+        try { await fn(payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {}); }
+        catch { socket.emit(event, { message: "Unable to complete chat request" }); }
+    };
+    socket.on("chat:send", safe("chat:error", async ({ meetingCode, message }) => {
+        const code = typeof meetingCode === "string" ? meetingCode.toUpperCase() : "";
+        if (!code || socket.data.meetingCode !== code || typeof message !== "string" || !message.trim() || message.trim().length > 2000) throw new Error("Invalid chat message");
+        const now = Date.now();
+        if (now - windowStarted > 10000) { windowStarted = now; sends = 0; }
+        if (++sends > 20) throw new Error("Too many messages");
+        const meeting = await Meeting.findOne({ meetingCode: code });
+        if (!meeting || meeting.status !== "live") throw new Error("Chat is only available during a live meeting");
+        if (!meeting.settings.allowChat && meeting.host.toString() !== socket.user.id) throw new Error("Chat is disabled");
+        const saved = await Message.create({ meeting: meeting._id, sender: socket.user.id, message: message.trim(), type: "user" });
+        const chatMessage = { id: saved._id.toString(), sender: { id: socket.user.id, name: socket.user.name, username: socket.user.username, avatar: socket.user.avatar }, message: saved.message, timestamp: saved.createdAt };
+        io.to(code).emit("chat:message", chatMessage);
+    }));
+
+    socket.on("chat:history", safe("chat:error", async ({ meetingCode }) => {
+        const code = typeof meetingCode === "string" ? meetingCode.toUpperCase() : "";
+        if (!code || socket.data.meetingCode !== code) return;
+        const meeting = await Meeting.findOne({ meetingCode: code });
+        if (!meeting) return;
+        if (meeting.status !== "live" || (!meeting.settings.allowChat && meeting.host.toString() !== socket.user.id)) throw new Error("Chat is unavailable");
+        const docs = await Message.find({ meeting: meeting._id }).sort({ createdAt: -1 }).limit(100).populate("sender", "name username avatar").lean();
+        socket.emit("chat:history", docs.reverse().map(msg => ({
+            id: msg._id.toString(),
+            sender: msg.sender ? { id: msg.sender._id.toString(), name: msg.sender.name, username: msg.sender.username, avatar: msg.sender.avatar } : null,
+            message: msg.message,
+            timestamp: msg.createdAt
+        })));
+    }));
+};
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\sockets\meeting.socket.js
+============================================================
+
+import { joinMeeting, admitParticipant, removeParticipant, removeWaitingParticipant, updateMeetingSettings, leaveMeeting as persistLeave } from "../services/meeting.service.js";
+import Meeting from "../models/Meeting.js";
+
+const meetingRooms = new Map();
+const safeHandler = (socket, eventName, fn) => async (payload) => {
+    try { await fn(payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {}); }
+    catch (error) { socket.emit(eventName, { message: error.statusCode && error.statusCode < 500 ? error.message : "Unable to complete request" }); }
+};
+const notifyWaiting = (io, hostId, event, payload) => io.to(`user:${hostId}`).emit(event, payload);
+const clearWaiting = async (io, socket, exceptCode) => {
+    const previous = socket.data.waitingMeetingCode;
+    if (!previous || previous === exceptCode) return;
+    const meeting = await Meeting.findOneAndUpdate({ meetingCode: previous }, { $pull: { waitingParticipants: { user: socket.user.id } } }, { new: true });
+    if (meeting) notifyWaiting(io, meeting.host.toString(), "waiting:left", { userId: socket.user.id, meetingCode: previous });
+    await socket.leave(`waiting:${previous}`);
+    socket.data.waitingMeetingCode = null;
+};
+const addSocketToMeeting = async (io, socket, code) => {
+    if (socket.data.meetingCode && socket.data.meetingCode !== code) await removeSocketFromMeeting(io, socket);
+    await clearWaiting(io, socket, code);
+    if (socket.data.waitingMeetingCode) {
+        const oldWaitingCode = socket.data.waitingMeetingCode;
+        await socket.leave(`waiting:${oldWaitingCode}`);
+        socket.data.waitingMeetingCode = null;
+    }
+    socket.join(code);
+    socket.data.meetingCode = code;
+    socket.data.waitingMeetingCode = null;
+    if (!meetingRooms.has(code)) meetingRooms.set(code, new Map());
+    const room = meetingRooms.get(code);
+    room.set(socket.id, { socketId: socket.id, user: socket.user ?? socket.data.user });
+    return [...room.values()];
+};
+
+export const registerMeetingSocket = (io, socket) => {
+    socket.on("meeting:join", safeHandler(socket, "meeting:error", async ({ meetingCode }) => {
+        if (typeof meetingCode !== "string") throw new Error("Invalid meeting code");
+        const result = await joinMeeting({ meetingCode, userId: socket.user.id, name: socket.user.name });
+        const code = result.meeting.meetingCode;
+        if (result.waiting) {
+            await clearWaiting(io, socket, code);
+            socket.data.waitingMeetingCode = code;
+            await socket.join(`waiting:${code}`);
+            socket.emit("waiting:status", { status: "waiting", meetingCode: code, message: "Waiting for the host to admit you" });
+            const waiting = result.meeting.waitingParticipants.find(w => w.user.toString() === socket.user.id);
+            const hostId = result.meeting.host.toString();
+            notifyWaiting(io, hostId, "waiting:participant", { user: socket.user, requestedAt: waiting?.requestedAt });
+            return;
+        }
+        const participants = await addSocketToMeeting(io, socket, code);
+        socket.emit("meeting:participants", participants);
+        socket.to(code).emit("participant:joined", { socketId: socket.id, user: socket.user });
+        if (result.meeting.host.toString() === socket.user.id) socket.emit("waiting:list", result.meeting.waitingParticipants);
+    }));
+
+    socket.on("meeting:leave", safeHandler(socket, "meeting:error", async () => removeSocketFromMeeting(io, socket)));
+
+    socket.on("host:admit", safeHandler(socket, "meeting:error", async ({ meetingCode, participantUserId }) => {
+        const participant = await admitParticipant(meetingCode, socket.user.id, participantUserId);
+        await admitWaitingSockets(io, meetingCode.toUpperCase(), participantUserId, participant);
+    }));
+
+    socket.on("host:reject", safeHandler(socket, "meeting:error", async ({ meetingCode, participantUserId }) => {
+        await removeWaitingParticipant(meetingCode, socket.user.id, participantUserId);
+        const code = meetingCode.toUpperCase();
+        const targets = await io.in(`user:${participantUserId}`).fetchSockets();
+        for (const target of targets) if (target.data.waitingMeetingCode === code) {
+            await target.leave(`waiting:${code}`);
+            target.data.waitingMeetingCode = null;
+            target.emit("waiting:rejected", { message: "The host did not admit you" });
+        }
+    }));
+
+    socket.on("host:remove", safeHandler(socket, "meeting:error", async ({ meetingCode, participantUserId }) => {
+        await removeParticipant(meetingCode, socket.user.id, participantUserId);
+        const code = meetingCode.toUpperCase();
+        const targets = await io.in(`user:${participantUserId}`).fetchSockets();
+        for (const target of targets) if (target.data.meetingCode === code) {
+            target.emit("participant:removed", { message: "You were removed by the host" });
+            await removeSocketFromMeeting(io, target, true);
+        }
+        io.to(code).emit("participant:removed", { userId: participantUserId });
+    }));
+
+    socket.on("meeting:lock", safeHandler(socket, "meeting:error", async ({ meetingCode, locked }) => {
+        if (typeof locked !== "boolean") throw new Error("locked must be a boolean");
+        const meeting = await updateMeetingSettings(meetingCode, socket.user.id, { lockMeeting: locked });
+        io.to(meeting.meetingCode).emit("meeting:settings-updated", { settings: meeting.settings });
+    }));
+
+    socket.on("screenshare:start", safeHandler(socket, "meeting:error", async ({ meetingCode }) => {
+        if (socket.data.meetingCode !== meetingCode?.toUpperCase()) throw new Error("Join the meeting first");
+        const meeting = await Meeting.findOne({ meetingCode: socket.data.meetingCode });
+        if (!meeting || meeting.status !== "live") throw new Error("Meeting is not live");
+        if (!meeting.settings.allowScreenShare && meeting.host.toString() !== socket.user.id) throw new Error("Screen sharing is disabled");
+        socket.to(socket.data.meetingCode).emit("screenshare:started", { socketId: socket.id });
+    }));
+    socket.on("screenshare:stop", safeHandler(socket, "meeting:error", async () => {
+        if (socket.data.meetingCode) socket.to(socket.data.meetingCode).emit("screenshare:stopped", { socketId: socket.id });
+    }));
+
+    const relay = (event, key) => (payload) => {
+        try {
+            const data = payload && typeof payload === "object" ? payload : {};
+            const code = socket.data.meetingCode;
+            if (!code || typeof data.to !== "string" || !data[key] || !meetingRooms.get(code)?.has(data.to)) return;
+            io.to(data.to).emit(event, { from: socket.id, [key]: data[key] });
+        } catch { socket.emit("meeting:error", { message: "Invalid signaling payload" }); }
+    };
+    socket.on("webrtc:offer", relay("webrtc:offer", "offer"));
+    socket.on("webrtc:answer", relay("webrtc:answer", "answer"));
+    socket.on("webrtc:ice-candidate", relay("webrtc:ice-candidate", "candidate"));
+};
+
+export const admitWaitingSockets = async (io, code, userId, participant) => {
+    const targets = await io.in(`user:${userId}`).fetchSockets();
+    for (const target of targets) if (target.data.waitingMeetingCode === code) {
+        const participants = await addSocketToMeeting(io, target, code);
+        target.emit("waiting:admitted", { meetingCode: code, participant });
+        target.emit("meeting:participants", participants);
+        io.to(code).emit("participant:joined", { socketId: target.id, user: target.data.user });
+    }
+};
+
+export const closeMeetingRoom = async (io, code) => {
+    io.to(code).emit("meeting:ended", { meetingCode: code });
+    io.to(`waiting:${code}`).emit("meeting:ended", { meetingCode: code });
+    const sockets = await io.in(code).fetchSockets();
+    for (const socket of sockets) await removeSocketFromMeeting(io, socket, true);
+    const waitingSockets = await io.in(`waiting:${code}`).fetchSockets();
+    for (const socket of waitingSockets) {
+        socket.data.waitingMeetingCode = null;
+        await socket.leave(`waiting:${code}`);
+    }
+    meetingRooms.delete(code);
+};
+
+export const removeSocketFromMeeting = async (io, socket, skipPersistence = false) => {
+    const user = socket.user ?? socket.data.user;
+    if (!user?.id) return;
+    const code = socket.data.meetingCode;
+    const waitingCode = socket.data.waitingMeetingCode;
+    if (waitingCode) {
+        const otherWaitingSockets = await io.in(`user:${user.id}`).fetchSockets();
+        const hasOtherWaitingSocket = otherWaitingSockets.some(other => other.id !== socket.id && other.data.waitingMeetingCode === waitingCode);
+        socket.data.waitingMeetingCode = null;
+        if (!hasOtherWaitingSocket) {
+            const meeting = await Meeting.findOneAndUpdate({ meetingCode: waitingCode }, { $pull: { waitingParticipants: { user: user.id } } }, { new: true });
+            if (meeting) notifyWaiting(io, meeting.host.toString(), "waiting:left", { userId: user.id, meetingCode: waitingCode });
+        }
+        await socket.leave(`waiting:${waitingCode}`);
+    }
+    if (!code) return;
+    const room = meetingRooms.get(code);
+    room?.delete(socket.id);
+    socket.leave(code);
+    socket.data.meetingCode = null;
+    io.to(code).except(socket.id).emit("participant:left", { socketId: socket.id, userId: user.id });
+    const stillHere = room && [...room.values()].some(p => p.user.id === user.id);
+    if (room?.size === 0) meetingRooms.delete(code);
+    if (!skipPersistence && !stillHere) {
+        try { await persistLeave(code, user.id); } catch (err) { if (err.statusCode !== 409) console.error("Unable to persist participant leave", err.message); }
+    }
+};
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\sockets\socket.js
+============================================================
+
+import { Server } from "socket.io";
+import { socketAuth } from "../middleware/socketAuth.js";
+
+import {
+    registerMeetingSocket,
+    removeSocketFromMeeting
+} from "./meeting.socket.js";
+
+import {
+    registerChatSocket
+} from "./chat.socket.js";
+
+
+export const initializeSocket = (server, env) => {
+
+    const io = new Server(server, {
+        cors: {
+            origin: env.clientUrl,
+            methods: ["GET", "POST"],
+            credentials: true
+        }
+    });
+
+    io.use(socketAuth);
+
+    io.on("connection", (socket) => {
+        socket.data.meetingCode = null;
+        socket.data.waitingMeetingCode = null;
+        socket.data.user = socket.user;
+        socket.join(`user:${socket.user.id}`);
+
+        console.log(
+            `Socket connected: ${socket.id}`
+        );
+
+        registerMeetingSocket(io, socket);
+
+        registerChatSocket(io, socket);
+
+        socket.on("disconnect", () => {
+
+            removeSocketFromMeeting(io, socket).catch((error) => {
+                console.error("Socket disconnect cleanup failed:", error.message);
+            });
+
+            console.log(
+                `Socket disconnected: ${socket.id}`
+            );
+        });
+    });
+
+    return io;
+};
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\utils\AppError.js
+============================================================
+
+export default class AppError extends Error {
+    constructor(message, statusCode = 400) {
+        super(message);
+        this.statusCode = statusCode;
+        this.isOperational = true;
+    }
+}
+
+
+
+============================================================
+FILE: C:\Users\hakim\OneDrive\Desktop\AuraMeet\backend\src\utils\token.js
+============================================================
+
+import jwt from "jsonwebtoken";
+import env from "../config/env.js";
+
+export const generateAccessToken = (user) => {
+    return jwt.sign(
+        {
+            sub: user._id.toString(),
+            role: user.role
+        },
+        env.jwtAccessSecret,
+        {
+            expiresIn: "15m"
+        }
+    );
+};
+
+export const generateRefreshToken = (user) => {
+    return jwt.sign(
+        {
+            sub: user._id.toString()
+        },
+        env.jwtRefreshSecret,
+        {
+            expiresIn: "7d"
+        }
+    );
+};
+
+export const verifyRefreshToken = (token) => {
+    return jwt.verify(
+        token,
+        env.jwtRefreshSecret
+    );
+};
